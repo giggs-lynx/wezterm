@@ -35,24 +35,15 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: "recursive"
-      - name: "Install Rust targets"
+      - name: "Install Rust target (Apple Silicon)"
         shell: bash
-        run: |
-          rustup target add aarch64-apple-darwin
-          rustup target add x86_64-apple-darwin
+        run: "rustup target add aarch64-apple-darwin"
       - name: "Compile with sccache"
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: "Install System Deps"
         shell: bash
         run: "env CI=yes PATH=$PATH ./get-deps"
-      - name: "Build (Intel)"
-        shell: bash
-        run: |
-          cargo build --target x86_64-apple-darwin -p wezterm --release
-          cargo build --target x86_64-apple-darwin -p wezterm-gui --release
-          cargo build --target x86_64-apple-darwin -p wezterm-mux-server --release
-          cargo build --target x86_64-apple-darwin -p strip-ansi-escapes --release
-      - name: "Build (ARM)"
+      - name: "Build (Apple Silicon)"
         shell: bash
         run: |
           cargo build --target aarch64-apple-darwin -p wezterm --release
