@@ -7,6 +7,7 @@ use crate::connection::ConnectionOps;
 use crate::os::macos::app::create_app_delegate;
 use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
+use crate::ApplicationEvent;
 use crate::Appearance;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicyRegular, NSScreen};
 use cocoa::base::{id, nil};
@@ -38,6 +39,10 @@ impl Connection {
 
             let delegate = create_app_delegate();
             let () = msg_send![ns_app, setDelegate: delegate];
+
+            // Register a system-wide (global) hotkey for the quake/dropdown
+            // terminal. This fires even when WezTerm is not frontmost.
+            register_global_hotkey();
 
             let conn = Self {
                 ns_app,
@@ -252,4 +257,119 @@ pub fn nsscreen_to_screen_info(screen: *mut Object) -> ScreenInfo {
 
 extern "C" {
     fn NSBeep();
+}
+
+// ---------------------------------------------------------------------------
+// Global hotkey support (Carbon RegisterEventHotKey).
+//
+// We use the classic Carbon hotkey API rather than a CGEventTap because it
+// requires no Accessibility/Input-Monitoring permission and is sufficient for
+// a single toggle hotkey. Carbon is already linked (see window/build.rs).
+//
+// PoC: the hotkey is hard-coded to Ctrl+Option+` here; it will become
+// configurable in a later phase.
+// ---------------------------------------------------------------------------
+
+use std::os::raw::c_void;
+
+type OSStatus = i32;
+type OSType = u32;
+type EventTargetRef = *mut c_void;
+type EventHandlerRef = *mut c_void;
+type EventHandlerCallRef = *mut c_void;
+type EventRef = *mut c_void;
+type EventHotKeyRef = *mut c_void;
+
+#[repr(C)]
+struct EventTypeSpec {
+    event_class: OSType,
+    event_kind: u32,
+}
+
+#[repr(C)]
+struct EventHotKeyID {
+    signature: OSType,
+    id: u32,
+}
+
+type EventHandlerUPP = extern "C" fn(EventHandlerCallRef, EventRef, *mut c_void) -> OSStatus;
+
+#[allow(non_snake_case)]
+extern "C" {
+    fn GetApplicationEventTarget() -> EventTargetRef;
+    fn InstallEventHandler(
+        inTarget: EventTargetRef,
+        inHandler: EventHandlerUPP,
+        inNumTypes: usize,
+        inList: *const EventTypeSpec,
+        inUserData: *mut c_void,
+        outRef: *mut EventHandlerRef,
+    ) -> OSStatus;
+    fn RegisterEventHotKey(
+        inHotKeyCode: u32,
+        inHotKeyModifiers: u32,
+        inHotKeyID: EventHotKeyID,
+        inTarget: EventTargetRef,
+        inOptions: u32,
+        outRef: *mut EventHotKeyRef,
+    ) -> OSStatus;
+}
+
+/// `kEventClassKeyboard` = 'keyb'
+const K_EVENT_CLASS_KEYBOARD: OSType = 0x6b65_7962;
+/// `kEventHotKeyPressed`
+const K_EVENT_HOT_KEY_PRESSED: u32 = 6;
+
+/// `kVK_F2`
+const K_VK_F2: u32 = 0x78;
+
+extern "C" fn hot_key_handler(
+    _call_ref: EventHandlerCallRef,
+    _event: EventRef,
+    _user_data: *mut c_void,
+) -> OSStatus {
+    if let Some(conn) = Connection::get() {
+        conn.dispatch_app_event(ApplicationEvent::ToggleQuakeTerminal);
+    }
+    0 // noErr
+}
+
+fn register_global_hotkey() {
+    unsafe {
+        let event_type = EventTypeSpec {
+            event_class: K_EVENT_CLASS_KEYBOARD,
+            event_kind: K_EVENT_HOT_KEY_PRESSED,
+        };
+        let status = InstallEventHandler(
+            GetApplicationEventTarget(),
+            hot_key_handler,
+            1,
+            &event_type,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            log::error!("InstallEventHandler for global hotkey failed: {status}");
+            return;
+        }
+
+        let hotkey_id = EventHotKeyID {
+            signature: 0x575a_514b, // 'WZQK'
+            id: 1,
+        };
+        let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
+        let status = RegisterEventHotKey(
+            K_VK_F2,
+            0, // no modifiers (bare F2)
+            hotkey_id,
+            GetApplicationEventTarget(),
+            0,
+            &mut hotkey_ref,
+        );
+        if status != 0 {
+            log::error!("RegisterEventHotKey(F2) failed: {status}");
+        } else {
+            log::info!("Registered global quake hotkey: F2");
+        }
+    }
 }
