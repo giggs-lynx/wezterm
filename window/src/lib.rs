@@ -39,6 +39,16 @@ pub use glium;
 pub use os::*;
 pub use wezterm_input_types::*;
 
+// Quake / dropdown terminal is macOS-only for now. On macOS the real
+// implementations come from `os::macos::window` via `pub use os::*`; provide
+// no-op stubs elsewhere so cross-platform callers compile.
+#[cfg(not(target_os = "macos"))]
+pub fn mark_next_window_as_quake() {}
+#[cfg(not(target_os = "macos"))]
+pub fn quake_toggle() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Clipboard {
     Clipboard,
@@ -313,6 +323,14 @@ pub trait WindowOps {
 
     /// Set window level. Depending on the environment and user preferences
     fn set_window_level(&self, _level: WindowLevel) {}
+
+    /// Quake/dropdown terminal: slide the window in from off-screen and show
+    /// it above other windows. macOS-only for now; no-op elsewhere.
+    fn quake_slide_in(&self) {}
+
+    /// Quake/dropdown terminal: slide the window back off-screen and hide it.
+    /// macOS-only for now; no-op elsewhere.
+    fn quake_slide_out(&self) {}
 
     /// Set the icon for the window.
     /// Depending on the system this may be shown in its titlebar

@@ -24,6 +24,9 @@ pub enum ApplicationEvent {
     /// The system wants to open a command in the terminal
     OpenCommandScript(String),
     PerformKeyAssignment(KeyAssignment),
+    /// A global hotkey was pressed to toggle the quake/dropdown terminal.
+    /// This can fire while WezTerm is not the frontmost application.
+    ToggleQuakeTerminal,
 }
 
 pub trait ConnectionOps {

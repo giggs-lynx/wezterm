@@ -391,6 +391,8 @@ pub(crate) struct WindowInner {
     view: StrongPtr,
     window: StrongPtr,
     config: ConfigHandle,
+    /// True if this is the dedicated quake/dropdown window.
+    is_quake: bool,
 }
 
 fn function_key_to_keycode(function_key: char) -> KeyCode {
@@ -430,6 +432,58 @@ pub struct Window {
 
 unsafe impl Send for Window {}
 unsafe impl Sync for Window {}
+
+// ---------------------------------------------------------------------------
+// Quake / dropdown terminal state (macOS)
+//
+// The quake window is a dedicated non-activating NSPanel. It must be built as
+// such at creation time (the non-activating style and collection behavior
+// cannot be applied reliably at runtime), so we tag the next window to be
+// created and remember which window ended up being the quake one. All access
+// is on the GUI/main thread.
+// ---------------------------------------------------------------------------
+thread_local! {
+    static NEXT_WINDOW_IS_QUAKE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static QUAKE_WINDOW_ID: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+    static QUAKE_VISIBLE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Mark the next window created via `new_window` as the quake window, so it is
+/// built as a non-activating panel with the quake collection behavior.
+pub fn mark_next_window_as_quake() {
+    NEXT_WINDOW_IS_QUAKE.with(|c| c.set(true));
+}
+
+fn take_next_window_is_quake() -> bool {
+    NEXT_WINDOW_IS_QUAKE.with(|c| c.replace(false))
+}
+
+fn set_quake_window_id(id: usize) {
+    QUAKE_WINDOW_ID.with(|c| c.set(Some(id)));
+}
+
+fn set_quake_visible(v: bool) {
+    QUAKE_VISIBLE.with(|c| c.set(v));
+}
+
+/// Toggle the quake window's slide if it exists. Returns false if there is no
+/// quake window yet, in which case the caller should create one.
+pub fn quake_toggle() -> bool {
+    let id = match QUAKE_WINDOW_ID.with(|c| c.get()) {
+        Some(id) => id,
+        None => return false,
+    };
+    let visible = QUAKE_VISIBLE.with(|c| c.get());
+    Connection::with_window_inner(id, move |inner| {
+        if visible {
+            inner.quake_slide_out();
+        } else {
+            inner.quake_slide_in();
+        }
+        Ok(())
+    });
+    true
+}
 
 fn set_window_position(window: *mut Object, coords: ScreenPoint) {
     unsafe {
@@ -483,9 +537,14 @@ impl Window {
         };
 
         unsafe {
+            // Is this window the dedicated quake/dropdown window? (Consumes the
+            // one-shot flag set by mark_next_window_as_quake.)
+            let is_quake = take_next_window_is_quake();
+
             let style_mask = decoration_to_mask(
                 config.window_decorations,
                 config.integrated_title_button_style,
+                is_quake,
             );
             let rect = NSRect::new(
                 NSPoint::new(0., 0.),
@@ -534,7 +593,27 @@ impl Window {
                 &window,
                 config.window_decorations,
                 config.integrated_title_button_style,
+                is_quake,
             );
+
+            if is_quake {
+                // Quake collection behavior: appear on the active Space
+                // (canJoinAllSpaces) and float over other windows; ignoresCycle
+                // keeps it out of Cmd-` cycling. fullScreenAuxiliary is set too,
+                // but overlaying another app's *native-fullscreen* Space does
+                // not work yet -- that needs the non-activating panel style,
+                // which macOS only honors when set in the window initializer
+                // (WezTerm's creation path can't pass it through cocoa's
+                // NSWindowStyleMask). Tracked as a known limitation for now.
+                const CAN_JOIN_ALL_SPACES: NSUInteger = 1 << 0;
+                const IGNORES_CYCLE: NSUInteger = 1 << 6;
+                const FULLSCREEN_AUXILIARY: NSUInteger = 1 << 8;
+                let behavior: NSUInteger =
+                    CAN_JOIN_ALL_SPACES | IGNORES_CYCLE | FULLSCREEN_AUXILIARY;
+                let () = msg_send![*window, setCollectionBehavior: behavior];
+                let () = msg_send![*window, setHidesOnDeactivate: NO];
+                set_quake_window_id(window_id);
+            }
 
             // Prevent Cocoa native tabs from being used
             let _: () = msg_send![*window, setTabbingMode:2 /* NSWindowTabbingModeDisallowed */];
@@ -652,6 +731,7 @@ impl Window {
                 window,
                 view,
                 config: config.clone(),
+                is_quake,
             }));
             inner.borrow_mut().window.replace(weak_window);
             conn.windows
@@ -706,10 +786,11 @@ pub type NSWindowLevel = i64;
 
 pub fn nswindow_level_to_window_level(nswindow_level: NSWindowLevel) -> WindowLevel {
     match nswindow_level {
-        -1 => WindowLevel::AlwaysOnBottom,
+        level if level <= -1 => WindowLevel::AlwaysOnBottom,
         0 => WindowLevel::Normal,
-        3 => WindowLevel::AlwaysOnTop,
-        _ => panic!("Invalid window level: {}", nswindow_level),
+        // Anything above Normal (including the popUpMenu-level 101 used by the
+        // quake terminal) reports as "always on top" for window-state purposes.
+        _ => WindowLevel::AlwaysOnTop,
     }
 }
 
@@ -805,6 +886,20 @@ impl WindowOps for Window {
     fn set_window_level(&self, level: WindowLevel) {
         Connection::with_window_inner(self.id, move |inner| {
             inner.set_window_level(level);
+            Ok(())
+        });
+    }
+
+    fn quake_slide_in(&self) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.quake_slide_in();
+            Ok(())
+        });
+    }
+
+    fn quake_slide_out(&self) {
+        Connection::with_window_inner(self.id, move |inner| {
+            inner.quake_slide_out();
             Ok(())
         });
     }
@@ -1056,6 +1151,7 @@ impl WindowInner {
                 &self.window,
                 self.config.window_decorations,
                 self.config.integrated_title_button_style,
+                self.is_quake,
             );
         }
     }
@@ -1109,6 +1205,7 @@ impl WindowInner {
                         &self.window,
                         self.config.window_decorations,
                         self.config.integrated_title_button_style,
+                        self.is_quake,
                     );
                     self.window.setFrame_display_(saved_rect, YES);
                     self.window.makeKeyAndOrderFront_(nil);
@@ -1229,6 +1326,12 @@ impl WindowInner {
 
 impl WindowInner {
     fn show(&mut self) {
+        // The quake window is never shown "normally"; showing it means sliding
+        // it in from off-screen as a non-activating panel.
+        if self.is_quake {
+            self.quake_slide_in();
+            return;
+        }
         unsafe {
             let current_app = NSRunningApplication::currentApplication(nil);
             current_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps);
@@ -1244,6 +1347,7 @@ impl WindowInner {
                 &self.window,
                 self.config.window_decorations,
                 self.config.integrated_title_button_style,
+                self.is_quake,
             );
 
             self.update_titlebar_background();
@@ -1261,6 +1365,63 @@ impl WindowInner {
     fn focus(&mut self) {
         unsafe {
             self.window.makeKeyAndOrderFront_(nil);
+        }
+    }
+
+    fn quake_slide_in(&mut self) {
+        unsafe {
+            let main_screen = NSScreen::mainScreen(nil);
+            // visibleFrame excludes the menu bar and Dock, matching iTerm2 /
+            // Ghostty behaviour of not covering the menu bar in the normal
+            // (non-fullscreen) case. The native-fullscreen overlay case may
+            // want the full frame later.
+            let screen_rect: NSRect = msg_send![main_screen, visibleFrame];
+            let size = screen_rect.size;
+
+            // Final: fill the visible area. Initial: identical size but shifted
+            // entirely above the top edge (off-screen) so it can slide down.
+            let final_rect = NSRect::new(screen_rect.origin, size);
+            let initial_rect = NSRect::new(
+                NSPoint::new(screen_rect.origin.x, screen_rect.origin.y + size.height),
+                size,
+            );
+
+            // Do NOT activate the app: activating forces macOS to leave another
+            // app's native-fullscreen Space (the "kicked back to desktop"
+            // behaviour). As a genuinely non-activating panel (style set at
+            // creation) with canJoinAllSpaces + fullScreenAuxiliary, the window
+            // can become key and overlay the current Space without activating.
+
+            // popUpMenu level renders above other windows and (with our
+            // constrainFrameRect override) lets the window sit off-screen.
+            const NS_POPUP_MENU_WINDOW_LEVEL: NSWindowLevel = 101;
+            NSWindow::setLevel_(*self.window, NS_POPUP_MENU_WINDOW_LEVEL);
+
+            // Park off-screen instantly, then order front.
+            self.window.setFrame_display_(initial_rect, YES);
+            self.window.makeKeyAndOrderFront_(nil);
+
+            // Animate the slide down (pure move; same size, so no GPU re-render).
+            let () = msg_send![*self.window, setFrame: final_rect display: YES animate: YES];
+
+            set_quake_visible(true);
+        }
+    }
+
+    fn quake_slide_out(&mut self) {
+        unsafe {
+            let frame = NSWindow::frame(*self.window);
+            let up_rect = NSRect::new(
+                NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height),
+                frame.size,
+            );
+
+            // Animate up off-screen. setFrame:animate: blocks until the
+            // animation completes, so we can order out immediately afterwards.
+            let () = msg_send![*self.window, setFrame: up_rect display: YES animate: YES];
+            self.window.orderOut_(nil);
+
+            set_quake_visible(false);
         }
     }
 
@@ -1437,8 +1598,9 @@ fn apply_decorations_to_window(
     window: &StrongPtr,
     decorations: WindowDecorations,
     integrated_title_button_style: IntegratedTitleButtonStyle,
+    is_quake: bool,
 ) {
-    let mask = decoration_to_mask(decorations, integrated_title_button_style);
+    let mask = decoration_to_mask(decorations, integrated_title_button_style, is_quake);
     let decorations = effective_decorations(decorations, integrated_title_button_style);
     unsafe {
         window.setStyleMask_(mask);
@@ -1482,13 +1644,14 @@ fn apply_decorations_to_window(
 fn decoration_to_mask(
     decorations: WindowDecorations,
     integrated_title_button_style: IntegratedTitleButtonStyle,
+    _is_quake: bool,
 ) -> NSWindowStyleMask {
     let decorations = effective_decorations(decorations, integrated_title_button_style);
     let decorations = decorations.difference(
         WindowDecorations::MACOS_FORCE_DISABLE_SHADOW
             | WindowDecorations::MACOS_FORCE_ENABLE_SHADOW,
     );
-    if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
+    let base_mask = if decorations == WindowDecorations::TITLE | WindowDecorations::RESIZE {
         NSWindowStyleMask::NSTitledWindowMask
             | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
@@ -1527,7 +1690,13 @@ fn decoration_to_mask(
             | NSWindowStyleMask::NSClosableWindowMask
             | NSWindowStyleMask::NSMiniaturizableWindowMask
             | NSWindowStyleMask::NSResizableWindowMask
-    }
+    };
+
+    // The non-activating panel bit is applied via raw Objective-C at quake
+    // window creation. cocoa's NSWindowStyleMask bitflags does not define that
+    // bit, so routing it through this type (from_bits_truncate) would silently
+    // drop it.
+    base_mask
 }
 
 unsafe fn get_view_class_name(id: id) -> Option<String> {
@@ -1965,11 +2134,46 @@ fn key_modifiers(flags: NSEventModifierFlags) -> Modifiers {
 /// NSWindow is to reject focus when it doesn't have a titlebar!
 fn get_window_class() -> &'static Class {
     Class::get(WINDOW_CLS_NAME).unwrap_or_else(|| {
-        let mut cls = ClassDecl::new(WINDOW_CLS_NAME, class!(NSWindow))
+        // Subclass NSPanel (not NSWindow) so the quake window can use the
+        // non-activating panel style, which is what lets it overlay another
+        // app's native-fullscreen Space (a plain NSWindow with the right
+        // collectionBehavior still cannot join a fullscreen Space -- verified
+        // empirically: isOnActiveSpace stayed 0). NSPanel is a subclass of
+        // NSWindow, so normal windows keep working.
+        let mut cls = ClassDecl::new(WINDOW_CLS_NAME, class!(NSPanel))
             .expect("Unable to register Window class");
 
         extern "C" fn yes(_: &mut Object, _: Sel) -> BOOL {
             YES
+        }
+
+        // By default NSWindow constrains a window's frame so its title bar
+        // stays on-screen, which prevents parking the quake window fully
+        // off-screen (needed so it can slide in from above). Returning the
+        // proposed rect unchanged disables that constraint.
+        // NOTE: this applies to all WezTerm windows for now; Phase 3 should
+        // scope it to the quake window only.
+        extern "C" fn constrain_frame_rect(
+            _this: &mut Object,
+            _sel: Sel,
+            frame_rect: NSRect,
+            _screen: id,
+        ) -> NSRect {
+            frame_rect
+        }
+
+        // Duration used by setFrame:display:animate: for the quake slide.
+        // Fixed at 0.2s to match Ghostty's default quick-terminal animation
+        // (the system default scales with distance and is longer for a
+        // full-height slide). Only the quake path uses animate:YES.
+        // NOTE: applies to all WezTerm windows for now; Phase 3 should scope
+        // this to the quake window / make it configurable.
+        extern "C" fn quake_animation_resize_time(
+            _this: &mut Object,
+            _sel: Sel,
+            _new_frame: NSRect,
+        ) -> f64 {
+            0.2
         }
 
         unsafe {
@@ -1980,6 +2184,16 @@ fn get_window_class() -> &'static Class {
             cls.add_method(
                 sel!(canBecomeMainWindow),
                 yes as extern "C" fn(&mut Object, Sel) -> BOOL,
+            );
+            cls.add_method(
+                sel!(constrainFrameRect:toScreen:),
+                constrain_frame_rect
+                    as extern "C" fn(&mut Object, Sel, NSRect, id) -> NSRect,
+            );
+            cls.add_method(
+                sel!(animationResizeTime:),
+                quake_animation_resize_time
+                    as extern "C" fn(&mut Object, Sel, NSRect) -> f64,
             );
         }
 

@@ -234,6 +234,16 @@ impl GuiFrontEnd {
 
     fn app_event_handler(event: ApplicationEvent) {
         log::trace!("Got app event {event:?}");
+
+        fn spawn_command(spawn: &SpawnCommand, spawn_where: SpawnWhere) {
+            let config = config::configuration();
+            let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
+            let size = config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
+            let term_config = Arc::new(config::TermConfig::with_config(config));
+
+            crate::spawn::spawn_command_impl(spawn, spawn_where, size, None, term_config)
+        }
+
         match event {
             ApplicationEvent::OpenCommandScript(file_name) => {
                 let quoted_file_name = match shlex::try_quote(&file_name) {
@@ -293,17 +303,6 @@ impl GuiFrontEnd {
                 // and the user picks an action from the menubar.
                 // This is not currently possible, but could be in the
                 // future.
-
-                fn spawn_command(spawn: &SpawnCommand, spawn_where: SpawnWhere) {
-                    let config = config::configuration();
-                    let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-                    let size =
-                        config.initial_size(dpi as u32, crate::cell_pixel_dims(&config, dpi).ok());
-                    let term_config = Arc::new(config::TermConfig::with_config(config));
-
-                    crate::spawn::spawn_command_impl(spawn, spawn_where, size, None, term_config)
-                }
-
                 match action {
                     KeyAssignment::QuitApplication => {
                         // If we get here, there are no windows that could have received
@@ -332,6 +331,16 @@ impl GuiFrontEnd {
                     _ => {
                         log::warn!("unhandled perform: {action:?}");
                     }
+                }
+            }
+            ApplicationEvent::ToggleQuakeTerminal => {
+                // If the dedicated quake window already exists, toggle its
+                // slide. Otherwise create one: it is built as a non-activating
+                // panel (see window::mark_next_window_as_quake) and slides in
+                // on creation via WindowInner::show.
+                if !::window::quake_toggle() {
+                    ::window::mark_next_window_as_quake();
+                    spawn_command(&SpawnCommand::default(), SpawnWhere::NewWindow);
                 }
             }
         }
