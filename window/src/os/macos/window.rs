@@ -1366,12 +1366,6 @@ impl WindowInner {
                 size,
             );
 
-            // Do NOT activate the app: activating forces macOS to leave another
-            // app's native-fullscreen Space (the "kicked back to desktop"
-            // behaviour). As a genuinely non-activating panel (style set at
-            // creation) with canJoinAllSpaces + fullScreenAuxiliary, the window
-            // can become key and overlay the current Space without activating.
-
             // popUpMenu level renders above other windows and (with our
             // constrainFrameRect override) lets the window sit off-screen.
             const NS_POPUP_MENU_WINDOW_LEVEL: NSWindowLevel = 101;
@@ -1380,6 +1374,17 @@ impl WindowInner {
             // Park off-screen instantly, then order front.
             self.window.setFrame_display_(initial_rect, YES);
             self.window.makeKeyAndOrderFront_(nil);
+
+            // Activate our app so the dropdown actually receives keyboard input.
+            // This window is not a true non-activating panel (that style must be
+            // set at creation and doesn't stick here), so being key is not enough
+            // to type into it unless the app is frontmost. We recorded the
+            // previous frontmost app above, and quake_slide_out reactivates it, so
+            // focus is handed back on hide. (Cost: summoning over another app's
+            // native-fullscreen Space kicks back to the desktop — that overlay
+            // case is a known, deferred limitation.)
+            let app: id = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, activateIgnoringOtherApps: YES];
 
             // Animate the slide down (pure move; same size, so no GPU re-render).
             let () = msg_send![*self.window, setFrame: final_rect display: YES animate: YES];
