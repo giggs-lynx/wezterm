@@ -429,6 +429,9 @@ thread_local! {
     static NEXT_WINDOW_IS_QUAKE: std::cell::Cell<bool> = std::cell::Cell::new(false);
     static QUAKE_WINDOW_ID: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
     static QUAKE_VISIBLE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    // pid of the app that was frontmost when the quake window slid in, so we can
+    // hand focus back to it on hide. -1 = none / it was us.
+    static QUAKE_PREV_APP_PID: std::cell::Cell<i32> = std::cell::Cell::new(-1);
 }
 
 /// Mark the next window created via `new_window` as the quake window, so it is
@@ -447,6 +450,36 @@ fn set_quake_window_id(id: usize) {
 
 fn set_quake_visible(v: bool) {
     QUAKE_VISIBLE.with(|c| c.set(v));
+}
+
+fn set_quake_prev_app_pid(pid: i32) {
+    QUAKE_PREV_APP_PID.with(|c| c.set(pid));
+}
+
+fn take_quake_prev_app_pid() -> i32 {
+    QUAKE_PREV_APP_PID.with(|c| c.replace(-1))
+}
+
+/// The NSScreen whose frame contains the current mouse location, falling back to
+/// mainScreen. Matches ghostty's `quick-terminal-screen = mouse`: the dropdown
+/// appears on the screen the pointer is on, not the keyboard-focused one (which
+/// is what `mainScreen` returns and required clicking a screen first).
+unsafe fn screen_under_mouse() -> id {
+    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let screens = NSScreen::screens(nil);
+    let count: NSUInteger = msg_send![screens, count];
+    for i in 0..count {
+        let scr: id = msg_send![screens, objectAtIndex: i];
+        let f: NSRect = NSScreen::frame(scr);
+        if mouse.x >= f.origin.x
+            && mouse.x < f.origin.x + f.size.width
+            && mouse.y >= f.origin.y
+            && mouse.y < f.origin.y + f.size.height
+        {
+            return scr;
+        }
+    }
+    NSScreen::mainScreen(nil)
 }
 
 /// Toggle the quake window's slide if it exists. Returns false if there is no
@@ -1304,12 +1337,25 @@ impl WindowInner {
 
     fn quake_slide_in(&mut self) {
         unsafe {
-            let main_screen = NSScreen::mainScreen(nil);
+            // Remember who was frontmost so quake_slide_out can hand focus back.
+            // We never activate our own app on show, so this is the user's app.
+            let ws: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let front: id = msg_send![ws, frontmostApplication];
+            let front_pid: i32 = if front != nil {
+                msg_send![front, processIdentifier]
+            } else {
+                -1
+            };
+            let our_pid = std::process::id() as i32;
+            set_quake_prev_app_pid(if front_pid != our_pid { front_pid } else { -1 });
+
+            // Appear on the screen the mouse is on (not the keyboard-focused one).
+            let target_screen = screen_under_mouse();
             // visibleFrame excludes the menu bar and Dock, matching iTerm2 /
             // Ghostty behaviour of not covering the menu bar in the normal
             // (non-fullscreen) case. The native-fullscreen overlay case may
             // want the full frame later.
-            let screen_rect: NSRect = msg_send![main_screen, visibleFrame];
+            let screen_rect: NSRect = msg_send![target_screen, visibleFrame];
             let size = screen_rect.size;
 
             // Final: fill the visible area. Initial: identical size but shifted
@@ -1354,6 +1400,22 @@ impl WindowInner {
             // animation completes, so we can order out immediately afterwards.
             let () = msg_send![*self.window, setFrame: up_rect display: YES animate: YES];
             self.window.orderOut_(nil);
+
+            // Hand focus back to whoever was frontmost when we slid in. The quake
+            // window grabs key status without activating our app, so orderOut
+            // alone does not restore the previous app's keyboard focus.
+            const NS_ACTIVATE_IGNORING_OTHER_APPS: NSUInteger = 1 << 1;
+            let pid = take_quake_prev_app_pid();
+            if pid > 0 {
+                let app: id = msg_send![
+                    class!(NSRunningApplication),
+                    runningApplicationWithProcessIdentifier: pid
+                ];
+                if app != nil {
+                    let _: () =
+                        msg_send![app, activateWithOptions: NS_ACTIVATE_IGNORING_OTHER_APPS];
+                }
+            }
 
             set_quake_visible(false);
         }
