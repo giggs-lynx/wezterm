@@ -27,8 +27,9 @@ jobs:
     runs-on: "macos-latest"
     env:
       CARGO_INCREMENTAL: "0"
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: "sccache"
+      # B: opt-level 1 (not 3) trades a little runtime perf for much faster
+      # codegen. Overrides [profile.release] only for CI, no Cargo.toml edit.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "1"
       MACOSX_DEPLOYMENT_TARGET: "10.12"
     steps:
       - name: "checkout repo"
@@ -38,8 +39,13 @@ jobs:
       - name: "Install Rust target (Apple Silicon)"
         shell: bash
         run: "rustup target add aarch64-apple-darwin"
-      - name: "Compile with sccache"
-        uses: mozilla-actions/sccache-action@v0.0.9
+      # A: cache the dependency build artifacts + cargo registry, keyed on the
+      # lockfile + toolchain, so only changed crates recompile on later runs.
+      # (Replaces sccache, which was giving ~0% cross-run hits here.)
+      - name: "Cache cargo build"
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "aarch64-apple-darwin"
       - name: "Install System Deps"
         shell: bash
         run: "env CI=yes PATH=$PATH ./get-deps"
