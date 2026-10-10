@@ -11,7 +11,8 @@ cask "wezterm" do
   desc "WezTerm fork with a macOS quake/dropdown terminal"
   homepage "https://github.com/giggs-lynx/wezterm"
 
-  app "WezTerm.app"
+  # The zip contains WezTerm-macos-#{version}/WezTerm.app.
+  app "WezTerm-macos-#{version}/WezTerm.app"
   [
     "wezterm",
     "wezterm-gui",
@@ -19,15 +20,6 @@ cask "wezterm" do
     "strip-ansi-escapes"
   ].each do |tool|
     binary "#{appdir}/WezTerm.app/Contents/MacOS/#{tool}"
-  end
-
-  preflight do
-    # The zip contains WezTerm-macos-#{version}/WezTerm.app; lift it out.
-    staged_subfolder = staged_path.glob(["WezTerm-*", "wezterm-*"]).first
-    if staged_subfolder
-      FileUtils.mv(staged_subfolder/"WezTerm.app", staged_path)
-      FileUtils.rm_rf(staged_subfolder)
-    end
   end
 
   zap trash: [
